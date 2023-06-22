@@ -1,30 +1,22 @@
 package main
 
 import (
-	"fmt"
 	"log"
+	"math"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 type (
 	PackageInfo struct {
 		Name     string
 		Provides []string
-	}
-	model struct {
-		pkgs        []string
-		cursor      int
-		choice      string
-		searchQuery string
-		visiblePkgs []string
-		gutter      string
-		mode        string // list, search, info
 	}
 )
 
@@ -52,101 +44,12 @@ func getPackages() ([]string, error) {
 	return packages, nil
 }
 
-func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		tea.EnterAltScreen,
-	)
-}
-
-func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch m.mode {
-		case "list":
-			switch msg.String() {
-			case "ctrl+c", "q":
-				return m, tea.Quit
-			case "up", "j":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-			case "down", "k":
-				if m.cursor < len(m.visiblePkgs)-1 {
-					m.cursor++
-				}
-			case "enter", " ":
-				m.choice = m.visiblePkgs[m.cursor]
-			case "/":
-				m.mode = "search"
-				m.searchQuery = ""
-			}
-		case "search":
-			switch msg.String() {
-			case "enter", " ":
-				m.mode = "list"
-				m.searchAndUpdateVisiblePkgs()
-			default:
-				m.searchQuery += msg.String()
-			}
-		}
+func worker(packages []string, packagesMap *sync.Map, wg *sync.WaitGroup) {
+	for _, p := range packages {
+		provides := getPackageProvides(p)
+		packagesMap.Store(p, provides)
 	}
-	return m, nil
-}
-
-func (m *model) View() string {
-	switch m.mode {
-	case "list":
-		return m.listView()
-	case "search":
-		return m.searchView()
-	default:
-		return "Unknown mode"
-	}
-}
-
-func (m *model) listView() string {
-	m.gutter = fmt.Sprintf("Cursor: %d/%d", m.cursor+1, len(m.visiblePkgs))
-
-	s := m.gutter + "\n\nChoose a package:\n\n"
-	for i, p := range m.visiblePkgs {
-		if i == m.cursor {
-			s += "> "
-		} else {
-			s += "  "
-		}
-		s += p + "\n"
-	}
-	s += "\n\nSelected: " + m.choice
-
-	return s
-}
-
-func (m *model) searchView() string {
-	return fmt.Sprintf("Search: %s", m.searchQuery)
-}
-
-func (m *model) searchAndUpdateVisiblePkgs() {
-	m.visiblePkgs = []string{}
-	for _, pkg := range m.pkgs {
-		if strings.Contains(pkg, m.searchQuery) {
-			m.visiblePkgs = append(m.visiblePkgs, pkg)
-		}
-	}
-}
-
-func worker(jobs <-chan string, results chan<- PackageInfo, done <-chan bool) {
-	for {
-		select {
-		case j, more := <-jobs:
-			if more {
-				results <- PackageInfo{Name: j, Provides: getPackageProvides(j)}
-			} else {
-				return
-			}
-		case <-done:
-			return
-		}
-	}
+	wg.Done()
 }
 
 func main() {
@@ -155,50 +58,95 @@ func main() {
 		log.Fatal(err)
 	}
 
-	jobs := make(chan string, len(packages))
-	results := make(chan PackageInfo, len(packages))
+	app := tview.NewApplication()
 
-	done := make(chan bool)
-	defer close(done)
+	// Create a new tabbed view
+	flex := tview.NewFlex().SetDirection(tview.FlexRow)
+	tabs := tview.NewList().ShowSecondaryText(true)
+	tabs.AddItem("Packages", "", 'p', nil)
+	tabs.AddItem("Search", "", 's', nil)
+	tabs.AddItem("Quit", "", 'q', func() {
+		app.Stop()
+	})
+	tabs.AddItem("Provided files", "", 'f', func() {
+		packagesMap := &sync.Map{}
 
-	var wg sync.WaitGroup
-	wg.Add(runtime.NumCPU())
-	for w := 1; w <= runtime.NumCPU(); w++ {
-		go func() {
-			worker(jobs, results, done)
-			wg.Done()
-		}()
-	}
+		var wg sync.WaitGroup
+		intermediate := math.Round(float64(runtime.NumCPU()) * 0.75)
+		numWorkers := int(intermediate)
+		packagesPerWorker := len(packages) / numWorkers
+		for w := 0; w < numWorkers; w++ {
+			start := w * packagesPerWorker
+			end := start + packagesPerWorker
+			if w == numWorkers-1 {
+				end = len(packages) // Make sure to include any remaining packages
+			}
+			wg.Add(1)
+			go worker(packages[start:end], packagesMap, &wg)
+		}
 
-	go func() {
 		wg.Wait()
-		close(results)
-	}()
+	})
 
-	go func() {
-		for _, p := range packages {
-			jobs <- p
+	tabs.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+		switch index {
+		case 0:
+			// Create a new new list
+			list := tview.NewList()
+			list.SetBorder(true).SetTitle("Packages")
+		case 1:
+			// Create a new input field
+			inputField := tview.NewInputField()
+			inputField.SetLabel("Search").SetFieldWidth(10).SetAcceptanceFunc(tview.InputFieldInteger)
+			inputField.SetDoneFunc(func(key tcell.Key) {
+				app.Stop()
+			})
+			inputField.SetBorder(true).SetTitle("Search")
+			inputField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				switch event.Key() {
+				case tcell.KeyEnter:
+					app.Stop()
+				}
+				return event
+			})
+			app.SetRoot(inputField, true)
+		case 2:
+			app.Stop()
+		case 3:
+			// Create a new text view for the gutter
+			gutter := tview.NewTextView()
+			gutter.SetText("Navigation info")
+			gutter.SetBorder(true).SetTitle("Provided files")
+			app.SetRoot(gutter, true)
 		}
-		close(jobs)
-	}()
+	})
 
-	packagesMap := &sync.Map{}
-	go func() {
-		for res := range results {
-			packagesMap.Store(res.Name, res.Provides)
+	tabs.SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+		switch index {
+		case 0:
+			// Create a new list
+			list := tview.NewList()
+			list.SetBorder(true).SetTitle("Packages")
+			for _, p := range packages {
+				list.AddItem(p, "", 0, nil)
+			}
+			list.SetSelectedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
+				// Create a new text view for the gutter
+				gutter := tview.NewTextView()
+				gutter.SetText("Navigation info")
+				gutter.SetBorder(true).SetTitle("Provided files")
+				app.SetRoot(gutter, true)
+			})
+			app.SetRoot(list, true)
 		}
-	}()
+	})
 
-	initialModel := model{
-		pkgs:        packages,
-		cursor:      0,
-		choice:      "",
-		visiblePkgs: packages,
-		mode:        "list",
+	if err := app.SetRoot(flex, true).SetFocus(flex).Run(); err != nil {
+		log.Fatalf("could not start program: %s", err.Error())
 	}
 
-	p := tea.NewProgram(&initialModel)
-	if _, err := p.Run(); err != nil {
+	// Run the application
+	if err := app.Run(); err != nil {
 		log.Fatalf("could not start program: %s", err)
 	}
 }
